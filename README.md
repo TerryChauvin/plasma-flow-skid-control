@@ -1,5 +1,26 @@
 # plasma-flow-skid-control
 
+![python](https://img.shields.io/badge/python-3.14%20(tested)-blue)
+![tests](https://img.shields.io/badge/tests-16%20passed%20(local)-brightgreen)
+![process](https://img.shields.io/badge/process-simulated-lightgrey)
+
+Control and supervision layers of a continuous-flow cold-plasma reactor skid, built on a **simulated process**:
+an IEC 61131-3 sequence with interlocks, a tested Python twin of it, a CSV journal and dashboard, and an
+autonomous Bayesian experiment campaign.
+
+What this shows:
+
+- **PLC logic** - a Structured Text program (`plc/plasma_skid.st`): state sequence, two PID loops, latched alarms and interlocks, recipes.
+- **Tested digital twin** - `sim/skid.py` mirrors the ST logic and runs against a first-order plant model with fault injection; 16 pytest tests.
+- **Supervision** - timestamped variable journal, alarm/state event log, matplotlib dashboard.
+- **Autonomous campaign** - Gaussian-process + expected-improvement search over recipe parameters, each experiment being a full simulated batch.
+
+![Injected cooling loss: the over-temperature interlock cuts the plasma and the skid goes to SAFE_STOP](docs/img/fault_demo.gif)
+
+*Real run of the simulator: cooling is lost at t = 45 s, temperature climbs to the 70 degC limit, the interlock cuts the plasma and the sequence goes to `SAFE_STOP`.*
+
+## Background
+
 A small personal demo of the control and supervision layers of a continuous-flow cold-plasma reactor skid,
 built on a **simulated process**. No real hardware, no real chemistry: the plant is a set of first-order
 models with noise. The point is the control logic and the tooling around it.
@@ -23,6 +44,38 @@ sequence, safety, supervision, and autonomous experiment campaigns.
 
 Planned, **not implemented**: PLC <-> SCADA link over Modbus/TCP (OpenPLC exposes the %IW/%QW/%MW
 registers used in the ST file) or OPC UA; today the supervision reads the Python twin directly.
+
+### State machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> PURGE: start (rising edge), no alarm, door closed
+    PURGE --> LIQUID_RAMP: purge time elapsed
+    LIQUID_RAMP --> IGNITE: flow at set-point, settled 3 s
+    IGNITE --> RUN: plasma detected
+    IGNITE --> SAFE_STOP: ignition timeout (IGNITION_FAIL)
+    RUN --> SAFE_STOP: run time elapsed
+    PURGE --> SAFE_STOP: new alarm or stop
+    LIQUID_RAMP --> SAFE_STOP: new alarm or stop
+    IGNITE --> SAFE_STOP: new alarm or stop
+    RUN --> SAFE_STOP: overpressure, overtemperature, gas loss, door open, or stop
+    SAFE_STOP --> IDLE: safe-stop time elapsed
+```
+
+Gas loss and door open are only monitored in the active states (`PURGE` to `RUN`); overpressure and
+overtemperature latch an alarm in any state, which then blocks the next start until acknowledged.
+
+### Data flow
+
+```mermaid
+flowchart LR
+    ST["plc/plasma_skid.st<br/>(ST, not compiled)"] -. "same logic" .- TWIN["sim/skid.py<br/>Controller + Plant"]
+    TWIN --> LOG["scada/logger.py<br/>variables.csv, events.csv"]
+    LOG --> DASH["scada/dashboard.py<br/>dashboard PNG"]
+    TWIN --> CAMP["scada/campaign.py<br/>GP + expected improvement"]
+    CAMP -- "next recipe" --> TWIN
+```
 
 ### Controller (ST and Python twin)
 
@@ -48,8 +101,24 @@ python -m scada.demo --fault cooling_loss     # also: gas_loss, blockage, door_o
 python -m scada.campaign --n-iter 12          # 4 random + 12 Bayesian experiments -> out/campaign/campaign.csv
 ```
 
-Tests cover the nominal sequence, each interlock, ignition failure, alarm latching and acknowledgement,
-recipe loading, PID convergence, the CSV journal, and a campaign that improves on its random start.
+Figures (`docs/img/`) are regenerated from real simulator runs with `python docs/make_figures.py`.
+
+![Nominal batch dashboard](docs/img/dashboard_nominal.png)
+![Campaign convergence](docs/img/campaign_convergence.png)
+
+## Tests
+
+`tests/test_skid.py` (14 tests, including parametrised cases):
+
+- nominal batch: set-points reached, no alarm, and the exact state order `PURGE > LIQUID_RAMP > IGNITE > RUN > SAFE_STOP > IDLE`;
+- each interlock (blockage, gas supply loss, cooling loss, door open) trips to `SAFE_STOP` with plasma, power and pump off and the right alarm bit set;
+- ignition failure, stop button, alarm latching after the cause is gone, start refused while latched, acknowledge refused while the condition persists, start refused with the door open;
+- recipes accepted only in `IDLE`;
+- PID convergence on a first-order plant and reverse-acting (cooling) behaviour;
+- the demo writes the CSV journal and the dashboard, with the `OVERPRESSURE` event logged.
+
+`tests/test_campaign.py` (2 tests): the simulated yield peaks near the hidden optimum, and a campaign
+improves on its random start and reaches > 0.85 of the simulated optimum.
 
 ## Limits
 
